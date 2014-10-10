@@ -70,6 +70,8 @@ usage() {
     echo -e "\t-c\t\tenable force detect mime type for file and set content-type for uploading file (usually the storage can do it self)"
     echo -e "\t-m\t\tadd MTIME filter. Usefull to upload only new files in large directory"
     echo -e "\t-s\t\tSpecify the maximum transfer rate you want use to upload. Supported appendix 'K', 'M', 'G'"
+    echo -e "\t-z\t\tTreat file as archive of a given type and extract it after upload. Supported formats 'tar', 'tar.gz', 'tar.bz2'"
+    echo -e "\t-D\t\tTurn developer mode on (verboses curl output etc)"
     echo "Params:"
     echo -e "\t <dest_dir>\tdestination directory or container in storage (ex. container/dir1/), not a file name"
     echo -e "\t <src_path>\tsource file or directory"
@@ -89,6 +91,8 @@ QUIETMODE="0"
 DETECT_MIMETYPE="0"
 MTIME=""
 SPEED=""
+EXTRACT_ARCHIVE=""
+DEBUG_MODE=""
 declare -a EXCLUDE_LIST
 
 # Utils
@@ -125,7 +129,7 @@ for arg in "$@"; do
     i=$((i + 1))
 done
 
-while getopts ":ra:u:k:d:Mqe:c:m:s:" Option; do
+while getopts ":ra:u:k:d:Mqe:c:m:s:z:D:" Option; do
     case $Option in
             r ) RECURSIVEMODE="1";;
             a ) AUTH_URL="$OPTARG";;
@@ -138,6 +142,8 @@ while getopts ":ra:u:k:d:Mqe:c:m:s:" Option; do
             c ) DETECT_MIMETYPE="1";;
             m ) MTIME="$OPTARG";;
             s ) SPEED="$OPTARG";;
+            z ) EXTRACT_ARCHIVE="$OPTARG";;
+            D ) DEBUG_MODE="$OPTARG";;
             * ) echo "[!] Invalid option" && usage && exit 1;;
     esac
 done
@@ -431,6 +437,11 @@ _upload() {
         header_content_type="-H Content-Type:$cont_type"
     fi
 
+    if [[ -n "$EXTRACT_ARCHIVE" ]]; then
+        dest_url="${dest_url}?extract-archive=${EXTRACT_ARCHIVE}"
+        MD5CHECK=0
+    fi
+
     # md5
     if [ "$MD5CHECK" == "1" ]; then
         header_etage="-H ETag:$filehash"
@@ -447,38 +458,57 @@ _upload() {
 
     # uploading
     temp_file=`mktemp /tmp/.supload.XXXXXX`
-    $CURL ${opts} -X PUT -H "X-Auth-Token: ${AUTH_TOKEN}" $header_content_type $header_etage $header_auto_delete "$dest_url" -g -T "$src" -s -D "$temp_file" 1> /dev/null
+    if [[ -n "$DEBUG_MODE" ]]; then
+        $CURL ${opts} -$DEBUG_MODE -X PUT -H "X-Auth-Token: ${AUTH_TOKEN}" $header_content_type $header_etage $header_auto_delete "$dest_url" -g -T "$src" -s -D "$temp_file"
+    else
+        $CURL ${opts} -X PUT -H "X-Auth-Token: ${AUTH_TOKEN}" $header_content_type $header_etage $header_auto_delete "$dest_url" -g -T "$src" -s -D "$temp_file" 1> /dev/null
+    fi
+
 
     resp_status=`cat "${temp_file}" | head -n1 | tr -d '\r'`
     resp_status="${resp_status#* }"
+
+    if [ "$resp_status" == "400 Bad Request" ]; then
+        rm -f "${temp_file}"
+        return 8
+    fi
+
     if [ "$resp_status" == "403 Forbidden" ]; then
         rm -f "${temp_file}"
         return 2
     fi
+
     if [ "$resp_status" == "401 Unauthorized" ]; then
         rm -f "${temp_file}"
         return 2
     fi
 
-    # get hash for uploaded file (from response)
-    etag=`cat "${temp_file}" | egrep -i -w -o "etag: .+" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed 's/etag: //g'`
-
-    if [ -z "$etag" ]; then
-        #cat "${temp_file}"
+    if [ "$resp_status" == "503 Service Unavailable" ]; then
         rm -f "${temp_file}"
-        return 1
+        return 7
     fi
 
-    if [ "$MD5CHECK" == "1" ]; then
-        if [ "z$etag" != "z$filehash" ]; then
+    if [[ -z "$EXTRACT_ARCHIVE" ]]; then
+        # get hash for uploaded file (from response)
+        etag=`cat "${temp_file}" | egrep -i -w -o "etag: .+" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed 's/etag: //g'`
+
+        if [ -z "$etag" ]; then
+            #cat "${temp_file}"
             rm -f "${temp_file}"
-            return 6
+            return 1
         fi
+
+        if [ "$MD5CHECK" == "1" ]; then
+            if [ "z$etag" != "z$filehash" ]; then
+                rm -f "${temp_file}"
+                return 6
+            fi
+        fi
+
+        echo "$etag"
     fi
 
     rm -f "${temp_file}"
-
-    echo "$etag"
 }
 
 
@@ -555,6 +585,18 @@ upload() {
 
             if [ $rc -eq 6 ]; then
                 msg "[.] Hash doesn't match after uploading."
+                sleep "$count"
+                continue
+            fi
+
+            if [ $rc -eq 7 ]; then
+                msg "[.] The selected service or feature is unavailable at the time of the request"
+                sleep "$count"
+                continue
+            fi
+
+            if [ $rc -eq 8 ]; then
+                msg "[.] Something is wrong with the request parameters"
                 sleep "$count"
                 continue
             fi
